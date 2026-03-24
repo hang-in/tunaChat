@@ -16,9 +16,9 @@ fn read_text_file(path: String) -> Result<String, String> {
 
 /// Scan a workspace root for projects (1-level deep).
 /// Classification:
-///   - .git + agent session (.claude/, .gemini/, .codex-cli/) → "project"
-///   - .git only → "discovered"
-///   - agent session only → "chat"
+///   - .git present → "project"
+///   - no .git but agent session exists → "chat"
+/// Also counts CLI agent sessions from ~/.claude/projects/
 #[tauri::command]
 fn scan_workspace(root: String) -> Result<Vec<serde_json::Value>, String> {
     let root_path = std::path::Path::new(&root);
@@ -28,6 +28,10 @@ fn scan_workspace(root: String) -> Result<Vec<serde_json::Value>, String> {
 
     let agent_session_dirs = [".claude", ".gemini", ".codex-cli", ".opencode"];
     let mut results = Vec::new();
+
+    // Resolve ~/.claude/projects/ for session counting
+    let home = dirs::home_dir().unwrap_or_default();
+    let claude_projects_dir = home.join(".claude").join("projects");
 
     let entries = std::fs::read_dir(root_path)
         .map_err(|e| format!("read_dir: {e}"))?;
@@ -39,24 +43,48 @@ fn scan_workspace(root: String) -> Result<Vec<serde_json::Value>, String> {
         }
 
         let name = entry.file_name().to_string_lossy().to_string();
-        // Skip hidden directories (except the ones we're looking for)
         if name.starts_with('.') {
             continue;
         }
 
         let has_git = path.join(".git").exists();
-        let has_agent_session = agent_session_dirs
+        let has_local_session = agent_session_dirs
             .iter()
             .any(|d| path.join(d).exists());
 
-        let project_type = match (has_git, has_agent_session) {
-            (true, _) => "project",     // .git 있으면 무조건 PROJECT
-            (false, true) => "chat",    // 세션만 있으면 CHATS
-            (false, false) => continue, // 둘 다 없으면 무시
+        // Count Claude Code sessions from ~/.claude/projects/<encoded-path>/
+        let abs_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let encoded_path = abs_path
+            .to_string_lossy()
+            .replace('\\', "-")
+            .replace('/', "-")
+            .replace(':', "-");
+        let claude_session_dir = claude_projects_dir.join(&encoded_path);
+        let session_count = if claude_session_dir.is_dir() {
+            std::fs::read_dir(&claude_session_dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|e| {
+                            e.path().extension().map_or(false, |ext| ext == "jsonl")
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        } else {
+            0
         };
 
-        // Detect default engine from which agent sessions exist
-        let default_engine = if path.join(".claude").exists() {
+        let has_any_session = has_local_session || session_count > 0;
+
+        let project_type = match (has_git, has_any_session) {
+            (true, _) => "project",
+            (false, true) => "chat",
+            (false, false) => continue,
+        };
+
+        // Detect default engine
+        let default_engine = if path.join(".claude").exists() || session_count > 0 {
             "claude"
         } else if path.join(".gemini").exists() {
             "gemini"
@@ -68,7 +96,14 @@ fn scan_workspace(root: String) -> Result<Vec<serde_json::Value>, String> {
             "claude"
         };
 
-        // Get git current branch
+        // Which engines have sessions
+        let mut engines: Vec<&str> = Vec::new();
+        if path.join(".claude").exists() || session_count > 0 { engines.push("claude"); }
+        if path.join(".gemini").exists() { engines.push("gemini"); }
+        if path.join(".codex-cli").exists() { engines.push("codex"); }
+        if path.join(".opencode").exists() { engines.push("opencode"); }
+
+        // Git current branch
         let git_branch = if has_git {
             std::process::Command::new("git")
                 .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -93,6 +128,8 @@ fn scan_workspace(root: String) -> Result<Vec<serde_json::Value>, String> {
             "type": project_type,
             "defaultEngine": default_engine,
             "gitBranch": git_branch,
+            "sessionCount": session_count,
+            "engines": engines,
         }));
     }
 
