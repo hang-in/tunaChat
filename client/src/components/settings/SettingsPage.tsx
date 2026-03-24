@@ -19,6 +19,7 @@ const ENGINE_INFO = [
   { id: 'claude', label: 'Claude', desc: 'Anthropic Claude Code CLI', cmd: 'claude' },
   { id: 'gemini', label: 'Gemini', desc: 'Google Gemini CLI', cmd: 'gemini' },
   { id: 'codex', label: 'Codex', desc: 'OpenAI Codex CLI', cmd: 'codex' },
+  { id: 'opencode', label: 'OpenCode', desc: 'SST OpenCode CLI', cmd: 'opencode' },
 ] as const;
 
 export function SettingsPage() {
@@ -121,6 +122,7 @@ function EnginesTab() {
       claude: ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
       gemini: ['gemini-2.5-pro', 'gemini-2.5-flash'],
       codex: ['o3', 'o4-mini'],
+      opencode: [],
     });
     setLoading(false);
   };

@@ -26,7 +26,7 @@ fn scan_workspace(root: String) -> Result<Vec<serde_json::Value>, String> {
         return Err(format!("not a directory: {root}"));
     }
 
-    let agent_session_dirs = [".claude", ".gemini", ".codex-cli"];
+    let agent_session_dirs = [".claude", ".gemini", ".codex-cli", ".opencode"];
     let mut results = Vec::new();
 
     let entries = std::fs::read_dir(root_path)
@@ -63,6 +63,8 @@ fn scan_workspace(root: String) -> Result<Vec<serde_json::Value>, String> {
             "gemini"
         } else if path.join(".codex-cli").exists() {
             "codex"
+        } else if path.join(".opencode").exists() {
+            "opencode"
         } else {
             "claude"
         };
@@ -138,6 +140,7 @@ fn get_project_context(project_path: String) -> Result<serde_json::Value, String
     let has_claude = path.join(".claude").exists();
     let has_gemini = path.join(".gemini").exists();
     let has_codex = path.join(".codex-cli").exists();
+    let has_opencode = path.join(".opencode").exists();
 
     // Read README.md or CLAUDE.md for markdown field
     let markdown = ["CLAUDE.md", "README.md"]
@@ -156,6 +159,7 @@ fn get_project_context(project_path: String) -> Result<serde_json::Value, String
         "hasClaudeSession": has_claude,
         "hasGeminiSession": has_gemini,
         "hasCodexSession": has_codex,
+        "hasOpenCodeSession": has_opencode,
         "markdown": if markdown.len() > 2000 { &markdown[..2000] } else { &markdown },
         "fileCount": file_count,
     }))

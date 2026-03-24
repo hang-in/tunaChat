@@ -10,6 +10,7 @@ from sidecar.runner import run_cli_agent, terminate_process
 from sidecar.runners.claude import ClaudeRunner
 from sidecar.runners.gemini import GeminiRunner
 from sidecar.runners.codex import CodexRunner
+from sidecar.runners.opencode import OpenCodeRunner
 
 
 class Router:
@@ -20,6 +21,7 @@ class Router:
             "claude": ClaudeRunner(),
             "gemini": GeminiRunner(),
             "codex": CodexRunner(),
+            "opencode": OpenCodeRunner(),
         }
         self._active: dict[int, asyncio.subprocess.Process | None] = {}
 

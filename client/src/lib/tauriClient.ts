@@ -471,6 +471,7 @@ class TauriClient {
             claude: ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
             gemini: ['gemini-2.5-pro', 'gemini-2.5-flash'],
             codex: ['o3', 'o4-mini'],
+            opencode: [],
           },
           memoryEntries: memoryEntries as any,
           activeBranches: [],
@@ -711,6 +712,7 @@ class TauriClient {
           claude: ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
           gemini: ['gemini-2.5-pro', 'gemini-2.5-flash'],
           codex: ['o3', 'o4-mini'],
+          opencode: [],
         };
         import('@/store/contextStore').then(({ useContextStore }) => {
           useContextStore.getState().setEngineList(engines);

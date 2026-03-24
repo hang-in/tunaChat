@@ -87,7 +87,7 @@ tunaChat (Tauri v2)
 
 ### 지원하는 AI 도구
 
-Claude Code · Codex · Gemini CLI
+Claude Code · Codex · Gemini CLI · OpenCode
 
 ### 준비물
 
@@ -210,7 +210,7 @@ tunaChat (Tauri v2)
 
 ### Supported AI Tools
 
-Claude Code · Codex · Gemini CLI
+Claude Code · Codex · Gemini CLI · OpenCode
 
 ### Prerequisites
 
