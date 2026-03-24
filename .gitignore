@@ -56,3 +56,20 @@ MANIFEST
 transport.bak/
 transport/
 tunaDish-dev/
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+test-results/
+playwright-report/
+
+# rawq vendor (cloned, not submodule)
+vendor/rawq/
