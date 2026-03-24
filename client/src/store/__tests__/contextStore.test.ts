@@ -1,0 +1,407 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import { useContextStore, selectConvBranches } from '@/store/contextStore';
+import type {
+  ContextTab,
+  ProjectContext,
+  MemoryEntry,
+  GitBranch,
+  ConversationBranch,
+  ReviewEntry,
+  ProgressState,
+} from '@/store/contextStore';
+
+const store = useContextStore;
+
+// Zustand v5: partial setState only — never pass replace=true as it wipes action functions.
+function resetStore() {
+  store.setState({
+    activeTab: 'overview',
+    projectContext: null,
+    memoryEntries: [],
+    gitBranches: [],
+    convBranchesByProject: {},
+    reviews: [],
+    progress: null,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Fixture factories
+// ---------------------------------------------------------------------------
+
+function makeMemoryEntry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
+  return {
+    id: 'mem-1',
+    type: 'decision',
+    title: 'Use Zustand',
+    content: 'Decided to use Zustand for state management.',
+    source: 'discussion',
+    tags: ['state', 'architecture'],
+    timestamp: 1_000_000,
+    ...overrides,
+  };
+}
+
+function makeGitBranch(overrides: Partial<GitBranch> = {}): GitBranch {
+  return {
+    name: 'feat/sprint-7',
+    status: 'active',
+    description: 'Sprint 7 stability work',
+    linkedEntryCount: 2,
+    linkedDiscussionCount: 1,
+    ...overrides,
+  };
+}
+
+function makeConvBranch(overrides: Partial<ConversationBranch> = {}): ConversationBranch {
+  return {
+    id: 'cb-1',
+    label: 'branch-session',
+    status: 'active',
+    ...overrides,
+  };
+}
+
+function makeReviewEntry(overrides: Partial<ReviewEntry> = {}): ReviewEntry {
+  return {
+    id: 'rev-1',
+    artifactId: 'art-42',
+    artifactVersion: 3,
+    status: 'pending',
+    reviewerComment: 'Looks good, minor nits.',
+    createdAt: 2_000_000,
+    ...overrides,
+  };
+}
+
+function makeProjectContext(overrides: Partial<ProjectContext> = {}): ProjectContext {
+  return {
+    project: 'tunachat',
+    engine: 'claude',
+    model: 'claude-3-5-sonnet',
+    triggerMode: 'always',
+    persona: null,
+    resumeToken: null,
+    gitCurrentBranch: 'main',
+    availableEngines: { claude: ['claude-3-5-sonnet', 'claude-3-opus'] },
+    memoryEntries: [makeMemoryEntry()],
+    activeBranches: [makeGitBranch()],
+    convBranches: [makeConvBranch()],
+    pendingReviewCount: 0,
+    recentDiscussions: [],
+    markdown: '# tunachat\nProject overview.',
+    ...overrides,
+  };
+}
+
+function makeProgressState(overrides: Partial<ProgressState> = {}): ProgressState {
+  return {
+    engine: 'claude',
+    model: 'claude-3-5-sonnet',
+    step: 2,
+    totalSteps: 5,
+    elapsed: 1234,
+    actions: [{ tool: 'read_file', phase: 'completed', ok: true }],
+    ...overrides,
+  };
+}
+
+/** Helper: get derived convBranches for the active project */
+function getConvBranches(): ConversationBranch[] {
+  return selectConvBranches(store.getState());
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+beforeEach(() => {
+  resetStore();
+});
+
+// ---------------------------------------------------------------------------
+// setActiveTab
+// ---------------------------------------------------------------------------
+
+describe('setActiveTab', () => {
+  it('changes activeTab to memory', () => {
+    store.getState().setActiveTab('memory');
+    expect(store.getState().activeTab).toBe<ContextTab>('memory');
+  });
+
+  it('changes activeTab to branches', () => {
+    store.getState().setActiveTab('branches');
+    expect(store.getState().activeTab).toBe<ContextTab>('branches');
+  });
+
+  it('changes activeTab back to overview', () => {
+    store.getState().setActiveTab('branches');
+    store.getState().setActiveTab('overview');
+    expect(store.getState().activeTab).toBe<ContextTab>('overview');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setProjectContext
+// ---------------------------------------------------------------------------
+
+describe('setProjectContext', () => {
+  it('stores the full context object', () => {
+    const ctx = makeProjectContext();
+    store.getState().setProjectContext(ctx);
+    expect(store.getState().projectContext).toEqual(ctx);
+  });
+
+  it('derives memoryEntries from ctx.memoryEntries', () => {
+    const entries = [makeMemoryEntry({ id: 'mem-a' }), makeMemoryEntry({ id: 'mem-b' })];
+    const ctx = makeProjectContext({ memoryEntries: entries });
+    store.getState().setProjectContext(ctx);
+    expect(store.getState().memoryEntries).toEqual(entries);
+  });
+
+  it('derives gitBranches from ctx.activeBranches', () => {
+    const branches = [makeGitBranch({ name: 'feat/x' }), makeGitBranch({ name: 'fix/y' })];
+    const ctx = makeProjectContext({ activeBranches: branches });
+    store.getState().setProjectContext(ctx);
+    expect(store.getState().gitBranches).toEqual(branches);
+  });
+
+  it('derives convBranches from ctx.convBranches via selector', () => {
+    const convs = [makeConvBranch({ id: 'cb-x' }), makeConvBranch({ id: 'cb-y' })];
+    const ctx = makeProjectContext({ convBranches: convs });
+    store.getState().setProjectContext(ctx);
+    expect(getConvBranches()).toEqual(convs);
+  });
+
+  it('does not affect reviews or progress', () => {
+    store.setState({ reviews: [makeReviewEntry()], progress: makeProgressState() });
+    store.getState().setProjectContext(makeProjectContext());
+    expect(store.getState().reviews).toHaveLength(1);
+    expect(store.getState().progress).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setMemoryEntries
+// ---------------------------------------------------------------------------
+
+describe('setMemoryEntries', () => {
+  it('replaces existing entries with the new array', () => {
+    store.setState({ memoryEntries: [makeMemoryEntry({ id: 'old' })] });
+    const newEntries = [makeMemoryEntry({ id: 'new-1' }), makeMemoryEntry({ id: 'new-2' })];
+    store.getState().setMemoryEntries(newEntries);
+    expect(store.getState().memoryEntries).toEqual(newEntries);
+  });
+
+  it('accepts an empty array and clears existing entries', () => {
+    store.setState({ memoryEntries: [makeMemoryEntry()] });
+    store.getState().setMemoryEntries([]);
+    expect(store.getState().memoryEntries).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setBranches
+// ---------------------------------------------------------------------------
+
+describe('setBranches', () => {
+  it('replaces gitBranches', () => {
+    const git = [makeGitBranch({ name: 'main' }), makeGitBranch({ name: 'develop' })];
+    const conv = [makeConvBranch({ id: 'cb-a' })];
+    store.getState().setBranches(git, conv);
+    expect(store.getState().gitBranches).toEqual(git);
+  });
+
+  it('clears previous gitBranches when new array is empty', () => {
+    store.setState({ gitBranches: [makeGitBranch()] });
+    store.getState().setBranches([], []);
+    expect(store.getState().gitBranches).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setReviews
+// ---------------------------------------------------------------------------
+
+describe('setReviews', () => {
+  it('replaces existing reviews with the new list', () => {
+    store.setState({ reviews: [makeReviewEntry({ id: 'old-rev' })] });
+    const newReviews = [makeReviewEntry({ id: 'r-1' }), makeReviewEntry({ id: 'r-2' })];
+    store.getState().setReviews(newReviews);
+    expect(store.getState().reviews).toEqual(newReviews);
+  });
+
+  it('accepts an empty array', () => {
+    store.setState({ reviews: [makeReviewEntry()] });
+    store.getState().setReviews([]);
+    expect(store.getState().reviews).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setProgress
+// ---------------------------------------------------------------------------
+
+describe('setProgress', () => {
+  it('stores a ProgressState object', () => {
+    const progress = makeProgressState();
+    store.getState().setProgress(progress);
+    expect(store.getState().progress).toEqual(progress);
+  });
+
+  it('clears progress when called with null', () => {
+    store.setState({ progress: makeProgressState() });
+    store.getState().setProgress(null);
+    expect(store.getState().progress).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setProjectConvBranches
+// ---------------------------------------------------------------------------
+
+describe('setProjectConvBranches', () => {
+  it('stores branches for a project key', () => {
+    const branches = [makeConvBranch({ id: 'cb-1' }), makeConvBranch({ id: 'cb-2' })];
+    store.getState().setProjectConvBranches('proj-a', branches);
+    expect(store.getState().convBranchesByProject['proj-a']).toEqual(branches);
+  });
+
+  it('updates derived convBranches when project matches active projectContext', () => {
+    store.getState().setProjectContext(makeProjectContext({ project: 'tunachat' }));
+    const branches = [makeConvBranch({ id: 'new-cb' })];
+    store.getState().setProjectConvBranches('tunachat', branches);
+    expect(getConvBranches()).toEqual(branches);
+  });
+
+  it('does not affect derived convBranches for a different project', () => {
+    store.getState().setProjectContext(makeProjectContext({ project: 'tunachat', convBranches: [makeConvBranch({ id: 'orig' })] }));
+    store.getState().setProjectConvBranches('other-proj', [makeConvBranch({ id: 'x' })]);
+    expect(getConvBranches().map(b => b.id)).toContain('orig');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// removeConvBranch
+// ---------------------------------------------------------------------------
+
+describe('removeConvBranch', () => {
+  it('removes a branch from convBranchesByProject', () => {
+    store.getState().setProjectContext(makeProjectContext({ project: 'tunachat', convBranches: [] }));
+    store.setState({
+      convBranchesByProject: { tunachat: [makeConvBranch({ id: 'del' }), makeConvBranch({ id: 'keep' })] },
+    });
+    store.getState().removeConvBranch('del');
+    expect(getConvBranches().map(b => b.id)).toEqual(['keep']);
+  });
+
+  it('removes from convBranchesByProject for all projects', () => {
+    store.setState({
+      convBranchesByProject: { 'proj-a': [makeConvBranch({ id: 'x' }), makeConvBranch({ id: 'y' })] },
+    });
+    store.getState().removeConvBranch('x');
+    expect(store.getState().convBranchesByProject['proj-a'].map(b => b.id)).toEqual(['y']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// removeMemoryEntry
+// ---------------------------------------------------------------------------
+
+describe('removeMemoryEntry', () => {
+  it('removes an entry by id', () => {
+    store.setState({ memoryEntries: [makeMemoryEntry({ id: 'a' }), makeMemoryEntry({ id: 'b' })] });
+    store.getState().removeMemoryEntry('a');
+    expect(store.getState().memoryEntries.map(e => e.id)).toEqual(['b']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setCodeSearchResults / setCodeMap / setCodeSearchLoading
+// ---------------------------------------------------------------------------
+
+describe('code search state', () => {
+  it('setCodeSearchResults stores results and clears loading', () => {
+    store.setState({ codeSearchLoading: true });
+    const results = { query: 'test', project: 'test-proj', available: true, results: [], query_ms: 0, total_tokens: 0 };
+    store.getState().setCodeSearchResults(results);
+    expect(store.getState().codeSearchResults).toEqual(results);
+    expect(store.getState().codeSearchLoading).toBe(false);
+  });
+
+  it('setCodeMap stores the map', () => {
+    const map = { project: 'test-proj', available: true, map: {} };
+    store.getState().setCodeMap(map);
+    expect(store.getState().codeMap).toEqual(map);
+  });
+
+  it('setCodeSearchLoading toggles loading state', () => {
+    store.getState().setCodeSearchLoading(true);
+    expect(store.getState().codeSearchLoading).toBe(true);
+    store.getState().setCodeSearchLoading(false);
+    expect(store.getState().codeSearchLoading).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setEngineList
+// ---------------------------------------------------------------------------
+
+describe('setEngineList', () => {
+  it('stores engine/model map', () => {
+    const engines = { claude: ['sonnet', 'opus'], gemini: ['pro'] };
+    store.getState().setEngineList(engines);
+    expect(store.getState().engineList).toEqual(engines);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setLastRpcResult
+// ---------------------------------------------------------------------------
+
+describe('setLastRpcResult', () => {
+  it('stores and clears RPC result', () => {
+    store.getState().setLastRpcResult({ method: 'test', ok: true, data: { ok: true } });
+    expect(store.getState().lastRpcResult).toEqual({ method: 'test', ok: true, data: { ok: true } });
+    store.getState().setLastRpcResult(null);
+    expect(store.getState().lastRpcResult).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// clear
+// ---------------------------------------------------------------------------
+
+describe('clear', () => {
+  it('resets all data fields to their defaults', () => {
+    store.getState().setProjectContext(makeProjectContext({
+      project: 'tunachat',
+      convBranches: [makeConvBranch()],
+    }));
+    store.setState({
+      memoryEntries: [makeMemoryEntry()],
+      gitBranches: [makeGitBranch()],
+      reviews: [makeReviewEntry()],
+      progress: makeProgressState(),
+    });
+
+    store.getState().clear();
+
+    const s = store.getState();
+    // clear()는 projectContext와 projectContextByKey를 보존 (세션 전환 시 즉시 복원용)
+    expect(s.projectContext).not.toBeNull();
+    expect(s.projectContextByKey).toHaveProperty('tunachat');
+    expect(s.memoryEntries).toHaveLength(0);
+    expect(s.gitBranches).toHaveLength(0);
+    // convBranchesByProject도 clear에서 유지
+    expect(s.reviews).toHaveLength(0);
+    expect(s.progress).toBeNull();
+  });
+
+  it('preserves activeTab (clear does not reset UI state)', () => {
+    store.getState().setActiveTab('branches');
+    store.getState().clear();
+    // activeTab is not part of the clear spec — the store keeps it as-is
+    expect(store.getState().activeTab).toBe<ContextTab>('branches');
+  });
+});

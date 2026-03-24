@@ -1,0 +1,643 @@
+/**
+ * SQLite 영구 저장소 (tauri-plugin-sql)
+ *
+ * 데이터 흐름:
+ *   Tauri invoke → Zustand (실시간 UI) + SQLite (영구 저장)
+ *   앱 시작 시: SQLite → Zustand (하이드레이션)
+ *
+ * Source of Truth: 로컬 SQLite (SSOT). 서버 없음.
+ */
+import Database from '@tauri-apps/plugin-sql';
+
+let db: Database | null = null;
+let initPromise: Promise<Database> | null = null;
+
+// ─── Schema ──────────────────────────────────────────────────────
+
+const SCHEMA_V1 = `
+CREATE TABLE IF NOT EXISTS schema_version (
+  version    INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+  key            TEXT PRIMARY KEY,
+  name           TEXT NOT NULL,
+  path           TEXT,
+  default_engine TEXT,
+  source         TEXT NOT NULL DEFAULT 'configured',
+  type           TEXT NOT NULL DEFAULT 'project',
+  updated_at     INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+  id            TEXT PRIMARY KEY,
+  project_key   TEXT NOT NULL,
+  label         TEXT NOT NULL,
+  type          TEXT NOT NULL DEFAULT 'main',
+  parent_id     TEXT,
+  source        TEXT DEFAULT 'tunachat',
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+  engine        TEXT,
+  model         TEXT,
+  persona       TEXT,
+  trigger_mode  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_key);
+CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id               TEXT PRIMARY KEY,
+  conversation_id  TEXT NOT NULL,
+  role             TEXT NOT NULL,
+  content          TEXT NOT NULL,
+  timestamp        INTEGER NOT NULL,
+  status           TEXT DEFAULT 'done',
+  progress_content TEXT,
+  engine           TEXT,
+  model            TEXT,
+  persona          TEXT,
+  metadata         TEXT,
+  created_at       INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS branches (
+  id               TEXT PRIMARY KEY,
+  conversation_id  TEXT NOT NULL,
+  label            TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'active',
+  checkpoint_id    TEXT,
+  session_id       TEXT,
+  git_branch       TEXT,
+  parent_branch_id TEXT,
+  created_at       INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_branch_conv ON branches(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_branch_session ON branches(session_id);
+
+-- FTS5 전문 검색
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+  content,
+  content='messages',
+  content_rowid='rowid',
+  tokenize='unicode61'
+);
+`;
+
+// FTS 트리거 — BEGIN...END 안에 ';'가 포함되므로 개별 문자열로 관리
+const FTS_TRIGGERS: string[] = [
+  `CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+     INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+     INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+     INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+     INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+   END`,
+];
+
+interface Migration {
+  version: number;
+  /** 세미콜론으로 분할 가능한 일반 SQL */
+  sql: string;
+  /** BEGIN...END 포함 등 별도 실행이 필요한 문장 */
+  rawStatements?: string[];
+  /** 실패해도 무시할 문장 (ALTER TABLE ADD COLUMN 등 — 이미 존재 시 에러 무시) */
+  safeStatements?: string[];
+}
+
+const MIGRATIONS: Migration[] = [
+  {
+    version: 1,
+    sql: SCHEMA_V1 + "INSERT OR IGNORE INTO schema_version (version) VALUES (1);",
+    rawStatements: FTS_TRIGGERS,
+  },
+  {
+    version: 2,
+    sql: `INSERT OR IGNORE INTO schema_version (version) VALUES (2);`,
+    // ALTER TABLE ADD COLUMN은 IF NOT EXISTS 미지원 → 개별 try-catch 필요
+    safeStatements: [
+      `ALTER TABLE conversations ADD COLUMN custom_label TEXT`,
+      `ALTER TABLE branches ADD COLUMN custom_label TEXT`,
+    ],
+  },
+  {
+    version: 3,
+    sql: `
+CREATE TABLE IF NOT EXISTS memos (
+  id              TEXT PRIMARY KEY,
+  message_id      TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  project_key     TEXT NOT NULL,
+  content         TEXT NOT NULL,
+  type            TEXT NOT NULL DEFAULT 'context',
+  tags            TEXT DEFAULT '[]',
+  created_at      INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_memo_project ON memos(project_key);
+CREATE INDEX IF NOT EXISTS idx_memo_message ON memos(message_id);
+
+INSERT OR IGNORE INTO schema_version (version) VALUES (3);
+    `,
+  },
+  {
+    version: 4,
+    sql: `INSERT OR IGNORE INTO schema_version (version) VALUES (4);`,
+    safeStatements: [
+      // resume token: 대화 재개 시 CLI --resume 인자로 사용
+      `ALTER TABLE conversations ADD COLUMN resume_token TEXT`,
+      // resume_engine: 토큰이 어느 엔진 것인지 (claude/gemini/codex)
+      `ALTER TABLE conversations ADD COLUMN resume_engine TEXT`,
+      // project_path: 프로젝트 디렉토리 경로 (rawq, CLI cwd 등에 사용)
+      `ALTER TABLE projects ADD COLUMN path_abs TEXT`,
+    ],
+  },
+  {
+    version: 5,
+    sql: `
+CREATE TABLE IF NOT EXISTS artifacts (
+  id              TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  branch_id       TEXT,
+  type            TEXT NOT NULL,
+  title           TEXT NOT NULL,
+  content         TEXT NOT NULL,
+  status          TEXT DEFAULT 'draft',
+  metadata        TEXT,
+  created_at      INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_artifact_conv ON artifacts(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_artifact_type ON artifacts(type);
+
+CREATE TABLE IF NOT EXISTS trace_log (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  conversation_id TEXT NOT NULL,
+  event_type      TEXT NOT NULL,
+  agent_role      TEXT,
+  detail          TEXT,
+  token_count     INTEGER,
+  cost_usd        REAL,
+  created_at      INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_trace_conv ON trace_log(conversation_id);
+
+INSERT OR IGNORE INTO schema_version (version) VALUES (5);
+    `,
+    safeStatements: [
+      `ALTER TABLE conversations ADD COLUMN total_input_tokens INTEGER DEFAULT 0`,
+      `ALTER TABLE conversations ADD COLUMN total_output_tokens INTEGER DEFAULT 0`,
+      `ALTER TABLE conversations ADD COLUMN total_cost_usd REAL DEFAULT 0`,
+      `ALTER TABLE projects ADD COLUMN workspace_root TEXT`,
+    ],
+  },
+];
+
+// ─── Init ────────────────────────────────────────────────────────
+
+/** DB 초기화 (앱 시작 시 1회). 동시 호출 안전. */
+export async function initDb(): Promise<Database> {
+  if (db) return db;
+  if (initPromise) return initPromise;
+  initPromise = (async () => {
+    const d = await Database.load('sqlite:tunachat.db');
+    await migrate(d);
+    db = d;
+    return d;
+  })();
+  return initPromise;
+}
+
+/** Tauri 환경 여부 확인 — 브라우저 dev에서는 SQLite 사용 불가 */
+export function isTauriEnv(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+async function migrate(d: Database): Promise<void> {
+  // schema_version 테이블이 없을 수 있으므로 try-catch
+  let currentVersion = 0;
+  try {
+    const rows = await d.select<{ version: number }[]>(
+      'SELECT version FROM schema_version ORDER BY version DESC LIMIT 1'
+    );
+    if (rows.length > 0) currentVersion = rows[0].version;
+  } catch {
+    // 테이블 없음 → 버전 0
+  }
+
+  for (const m of MIGRATIONS) {
+    if (m.version > currentVersion) {
+      // 실패해도 무시할 문장 먼저 실행 (ALTER TABLE ADD COLUMN 등)
+      if (m.safeStatements) {
+        for (const stmt of m.safeStatements) {
+          try { await d.execute(stmt + ';'); } catch { /* 이미 존재 등 — 무시 */ }
+        }
+      }
+      // 세미콜론으로 분할 가능한 일반 SQL
+      const statements = m.sql
+        .split(';')
+        .map(s => s.trim())
+        .filter(s => s.length > 0);
+      for (const stmt of statements) {
+        await d.execute(stmt + ';');
+      }
+      // BEGIN...END 포함 문장은 분할 없이 그대로 실행
+      if (m.rawStatements) {
+        for (const raw of m.rawStatements) {
+          await d.execute(raw);
+        }
+      }
+    }
+  }
+}
+
+// ─── Projects ────────────────────────────────────────────────────
+
+export async function upsertProject(proj: {
+  key: string;
+  name: string;
+  path?: string | null;
+  defaultEngine?: string | null;
+  source?: string;
+  type?: string;
+}): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `INSERT INTO projects (key, name, path, default_engine, source, type)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT(key) DO UPDATE SET
+       name = excluded.name,
+       path = excluded.path,
+       default_engine = excluded.default_engine,
+       source = excluded.source,
+       type = excluded.type,
+       updated_at = unixepoch()`,
+    [proj.key, proj.name, proj.path ?? null, proj.defaultEngine ?? null,
+     proj.source ?? 'configured', proj.type ?? 'project'],
+  );
+}
+
+export async function loadProjects(): Promise<Array<{
+  key: string; name: string; path?: string; defaultEngine?: string;
+  source: string; type: string;
+}>> {
+  const d = await initDb();
+  return d.select(
+    `SELECT key, name, path, default_engine as defaultEngine, source, type
+     FROM projects ORDER BY updated_at DESC`,
+  );
+}
+
+// ─── Conversations ───────────────────────────────────────────────
+
+export async function upsertConversation(conv: {
+  id: string;
+  projectKey: string;
+  label: string;
+  type?: string;
+  parentId?: string | null;
+  source?: string;
+  createdAt: number;
+  engine?: string;
+  model?: string;
+  persona?: string;
+  triggerMode?: string;
+}): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `INSERT INTO conversations (id, project_key, label, type, parent_id, source, created_at, engine, model, persona, trigger_mode)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     ON CONFLICT(id) DO UPDATE SET
+       label = excluded.label,
+       source = excluded.source,
+       engine = COALESCE(excluded.engine, engine),
+       model = COALESCE(excluded.model, model),
+       persona = COALESCE(excluded.persona, persona),
+       trigger_mode = COALESCE(excluded.trigger_mode, trigger_mode),
+       updated_at = unixepoch()`,
+    [conv.id, conv.projectKey, conv.label, conv.type ?? 'main',
+     conv.parentId ?? null, conv.source ?? 'tunachat', conv.createdAt,
+     conv.engine ?? null, conv.model ?? null, conv.persona ?? null, conv.triggerMode ?? null],
+  );
+}
+
+export async function addTokenUsage(convId: string, inputTokens: number, outputTokens: number, costUsd: number): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `UPDATE conversations SET
+       total_input_tokens = COALESCE(total_input_tokens, 0) + $1,
+       total_output_tokens = COALESCE(total_output_tokens, 0) + $2,
+       total_cost_usd = COALESCE(total_cost_usd, 0) + $3,
+       updated_at = unixepoch()
+     WHERE id = $4`,
+    [inputTokens, outputTokens, costUsd, convId],
+  );
+}
+
+export async function insertTraceLog(entry: {
+  conversationId: string; eventType: string; agentRole?: string;
+  detail?: string; tokenCount?: number; costUsd?: number;
+}): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `INSERT INTO trace_log (conversation_id, event_type, agent_role, detail, token_count, cost_usd)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [entry.conversationId, entry.eventType, entry.agentRole ?? null,
+     entry.detail ?? null, entry.tokenCount ?? null, entry.costUsd ?? null],
+  );
+}
+
+export async function deleteConversation(convId: string): Promise<void> {
+  const d = await initDb();
+  await d.execute('DELETE FROM messages WHERE conversation_id = $1', [convId]);
+  await d.execute('DELETE FROM conversations WHERE id = $1', [convId]);
+}
+
+export async function updateConvLabel(convId: string, label: string): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `UPDATE conversations SET custom_label = $1, updated_at = unixepoch() WHERE id = $2`,
+    [label, convId],
+  );
+}
+
+export async function updateConvSettings(convId: string, settings: {
+  engine?: string;
+  model?: string;
+  persona?: string;
+  triggerMode?: string;
+}): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `UPDATE conversations SET
+       engine = COALESCE($1, engine),
+       model = COALESCE($2, model),
+       persona = COALESCE($3, persona),
+       trigger_mode = COALESCE($4, trigger_mode),
+       updated_at = unixepoch()
+     WHERE id = $5`,
+    [settings.engine ?? null, settings.model ?? null,
+     settings.persona ?? null, settings.triggerMode ?? null, convId],
+  );
+}
+
+export async function updateResumeToken(convId: string, engine: string, token: string): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `UPDATE conversations SET resume_token = $1, resume_engine = $2, updated_at = unixepoch() WHERE id = $3`,
+    [token, engine, convId],
+  );
+}
+
+export async function getResumeToken(convId: string): Promise<{ engine: string; token: string } | null> {
+  const d = await initDb();
+  const rows = await d.select<{ resume_token: string | null; resume_engine: string | null }[]>(
+    `SELECT resume_token, resume_engine FROM conversations WHERE id = $1`,
+    [convId],
+  );
+  if (rows.length > 0 && rows[0].resume_token && rows[0].resume_engine) {
+    return { engine: rows[0].resume_engine, token: rows[0].resume_token };
+  }
+  return null;
+}
+
+export async function loadConversations(projectKey: string): Promise<Array<{
+  id: string; projectKey: string; label: string; type: string;
+  source: string; createdAt: number; engine?: string; model?: string;
+  persona?: string; triggerMode?: string;
+}>> {
+  const d = await initDb();
+  return d.select(
+    `SELECT id, project_key as projectKey, COALESCE(custom_label, label) as label, type, source, created_at as createdAt, engine, model, persona, trigger_mode as triggerMode
+     FROM conversations WHERE project_key = $1
+     ORDER BY updated_at DESC`,
+    [projectKey],
+  );
+}
+
+/** 모든 프로젝트의 대화를 한번에 로드 (hydration용) */
+export async function loadAllConversations(): Promise<Array<{
+  id: string; projectKey: string; label: string; type: string;
+  source: string; createdAt: number; engine?: string; model?: string;
+  persona?: string; triggerMode?: string;
+}>> {
+  const d = await initDb();
+  return d.select(
+    `SELECT id, project_key as projectKey, COALESCE(custom_label, label) as label, type, source, created_at as createdAt, engine, model, persona, trigger_mode as triggerMode
+     FROM conversations
+     ORDER BY updated_at DESC`,
+  );
+}
+
+// ─── Messages ────────────────────────────────────────────────────
+
+export async function upsertMessage(msg: {
+  id: string;
+  conversationId: string;
+  role: string;
+  content: string;
+  timestamp: number;
+  status?: string;
+  engine?: string;
+  model?: string;
+  persona?: string;
+}): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `INSERT INTO messages (id, conversation_id, role, content, timestamp, status, engine, model, persona)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT(id) DO UPDATE SET
+       content = excluded.content,
+       status = excluded.status,
+       engine = COALESCE(excluded.engine, engine),
+       model = COALESCE(excluded.model, model),
+       persona = COALESCE(excluded.persona, persona)`,
+    [msg.id, msg.conversationId, msg.role, msg.content, msg.timestamp,
+     msg.status ?? 'done', msg.engine ?? null, msg.model ?? null, msg.persona ?? null],
+  );
+}
+
+export async function loadMessages(
+  conversationId: string,
+  limit = 200,
+  beforeTimestamp?: number,
+): Promise<Array<{
+  id: string; role: string; content: string; timestamp: number;
+  status: string; engine?: string; model?: string; persona?: string;
+}>> {
+  const d = await initDb();
+  if (beforeTimestamp) {
+    return d.select(
+      `SELECT id, role, content, timestamp, status, engine, model, persona
+       FROM messages WHERE conversation_id = $1 AND timestamp < $2
+       ORDER BY timestamp ASC LIMIT $3`,
+      [conversationId, beforeTimestamp, limit],
+    );
+  }
+  return d.select(
+    `SELECT id, role, content, timestamp, status, engine, model, persona
+     FROM messages WHERE conversation_id = $1
+     ORDER BY timestamp ASC LIMIT $2`,
+    [conversationId, limit],
+  );
+}
+
+// ─── Branches ────────────────────────────────────────────────────
+
+export async function upsertBranch(branch: {
+  id: string;
+  conversationId: string;
+  label: string;
+  status?: string;
+  checkpointId?: string;
+  sessionId?: string;
+  gitBranch?: string;
+  parentBranchId?: string;
+}): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `INSERT INTO branches (id, conversation_id, label, status, checkpoint_id, session_id, git_branch, parent_branch_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT(id) DO UPDATE SET
+       label = excluded.label,
+       status = COALESCE(excluded.status, status),
+       checkpoint_id = COALESCE(excluded.checkpoint_id, checkpoint_id),
+       session_id = COALESCE(excluded.session_id, session_id)`,
+    [branch.id, branch.conversationId, branch.label, branch.status ?? 'active',
+     branch.checkpointId ?? null, branch.sessionId ?? null,
+     branch.gitBranch ?? null, branch.parentBranchId ?? null],
+  );
+}
+
+export async function updateBranchLabel(branchId: string, label: string): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `UPDATE branches SET custom_label = $1 WHERE id = $2`,
+    [label, branchId],
+  );
+}
+
+export async function deleteBranch(branchId: string): Promise<void> {
+  const d = await initDb();
+  await d.execute('DELETE FROM branches WHERE id = $1', [branchId]);
+}
+
+export async function updateBranchStatus(branchId: string, status: string): Promise<void> {
+  const d = await initDb();
+  await d.execute('UPDATE branches SET status = $1 WHERE id = $2', [status, branchId]);
+}
+
+export async function loadBranches(conversationId: string): Promise<Array<{
+  id: string; label: string; status: string; checkpointId?: string;
+  sessionId?: string; gitBranch?: string; parentBranchId?: string;
+}>> {
+  const d = await initDb();
+  return d.select(
+    `SELECT id, COALESCE(custom_label, label) as label, status, checkpoint_id as checkpointId, session_id as sessionId,
+            git_branch as gitBranch, parent_branch_id as parentBranchId
+     FROM branches WHERE conversation_id = $1
+     ORDER BY created_at DESC`,
+    [conversationId],
+  );
+}
+
+// ─── Memos ──────────────────────────────────────────────────────
+
+export async function insertMemo(memo: {
+  id: string;
+  messageId: string;
+  conversationId: string;
+  projectKey: string;
+  content: string;
+  type?: string;
+  tags?: string[];
+}): Promise<void> {
+  const d = await initDb();
+  await d.execute(
+    `INSERT OR IGNORE INTO memos (id, message_id, conversation_id, project_key, content, type, tags)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [memo.id, memo.messageId, memo.conversationId, memo.projectKey,
+     memo.content, memo.type ?? 'context', JSON.stringify(memo.tags ?? [])],
+  );
+}
+
+export async function deleteMemo(memoId: string): Promise<void> {
+  const d = await initDb();
+  await d.execute('DELETE FROM memos WHERE id = $1', [memoId]);
+}
+
+export async function deleteMemoByMessageId(messageId: string): Promise<void> {
+  const d = await initDb();
+  await d.execute('DELETE FROM memos WHERE message_id = $1', [messageId]);
+}
+
+export async function loadMemos(projectKey: string): Promise<Array<{
+  id: string; messageId: string; conversationId: string;
+  content: string; type: string; tags: string; createdAt: number;
+}>> {
+  const d = await initDb();
+  return d.select(
+    `SELECT id, message_id as messageId, conversation_id as conversationId,
+            content, type, tags, created_at as createdAt
+     FROM memos WHERE project_key = $1
+     ORDER BY created_at DESC`,
+    [projectKey],
+  );
+}
+
+export async function loadSavedMessageIds(projectKey: string): Promise<Set<string>> {
+  const d = await initDb();
+  const rows = await d.select<{ messageId: string }[]>(
+    'SELECT message_id as messageId FROM memos WHERE project_key = $1',
+    [projectKey],
+  );
+  return new Set(rows.map(r => r.messageId));
+}
+
+export async function deleteAllMemos(projectKey: string): Promise<void> {
+  const d = await initDb();
+  await d.execute('DELETE FROM memos WHERE project_key = $1', [projectKey]);
+}
+
+// ─── Search ──────────────────────────────────────────────────────
+
+/** 디버그: DB 상태 확인 */
+export async function debugDbState(): Promise<{ msgCount: number; ftsCount: number; sample: string[] }> {
+  const d = await initDb();
+  const msgs = await d.select<{ cnt: number }[]>('SELECT count(*) as cnt FROM messages');
+  const fts = await d.select<{ cnt: number }[]>('SELECT count(*) as cnt FROM messages_fts');
+  const samples = await d.select<{ content: string }[]>(
+    'SELECT content FROM messages ORDER BY timestamp DESC LIMIT 3',
+  );
+  return {
+    msgCount: msgs[0]?.cnt ?? 0,
+    ftsCount: fts[0]?.cnt ?? 0,
+    sample: samples.map(s => s.content.slice(0, 50)),
+  };
+}
+
+export async function searchMessages(query: string, limit = 50): Promise<Array<{
+  id: string;
+  conversationId: string;
+  content: string;
+  timestamp: number;
+  rank: number;
+}>> {
+  const d = await initDb();
+  return d.select(
+    `SELECT m.id, m.conversation_id as conversationId, m.content, m.timestamp, rank
+     FROM messages_fts fts
+     JOIN messages m ON m.rowid = fts.rowid
+     WHERE messages_fts MATCH $1
+     ORDER BY rank
+     LIMIT $2`,
+    [query, limit],
+  );
+}

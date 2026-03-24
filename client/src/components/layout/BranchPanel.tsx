@@ -1,0 +1,341 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useSystemStore } from '@/store/systemStore';
+import { useChatStore, type ChatMessage } from '@/store/chatStore';
+import { useContextStore } from '@/store/contextStore';
+import { tauriClient } from '@/lib/tauriClient';
+import * as dbSync from '@/lib/dbSync';
+import { computeMsgMeta } from '@/lib/messageGrouping';
+import { MessageView } from '@/components/chat/MessageView';
+import { InputArea } from '@/components/chat/InputArea';
+import { isTauriEnv } from '@/lib/db';
+import {
+  X,
+  GitFork,
+  GitMerge,
+  Archive,
+} from '@phosphor-icons/react';
+
+const EMPTY_MESSAGES: ChatMessage[] = [];
+
+/** checkpointId에 해당하는 메시지 쌍을 메시지 배열에서 찾아 반환 */
+function findCheckpointContext(parentMsgs: ChatMessage[] | undefined, checkpointId: string | undefined): ChatMessage[] {
+  if (!checkpointId || !parentMsgs?.length) return [];
+
+  // checkpointId에 해당하는 메시지 찾기
+  const cpIdx = parentMsgs.findIndex(m => m.id === checkpointId);
+  if (cpIdx < 0) return [];
+
+  const cpMsg = parentMsgs[cpIdx];
+  const result: ChatMessage[] = [];
+
+  // checkpoint 메시지가 assistant면 직전 user 메시지도 포함
+  if (cpMsg.role === 'assistant') {
+    for (let i = cpIdx - 1; i >= 0; i--) {
+      if (parentMsgs[i].role === 'user') {
+        result.push({ ...parentMsgs[i], id: `ctx-${parentMsgs[i].id}` });
+        break;
+      }
+    }
+  }
+  // checkpoint 메시지가 user면 직후 assistant 메시지도 포함
+  result.push({ ...cpMsg, id: `ctx-${cpMsg.id}` });
+  if (cpMsg.role === 'user') {
+    for (let i = cpIdx + 1; i < parentMsgs.length; i++) {
+      if (parentMsgs[i].role === 'assistant') {
+        result.push({ ...parentMsgs[i], id: `ctx-${parentMsgs[i].id}` });
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+export function BranchPanel() {
+  const branchId = useSystemStore(s => s.branchPanelBranchId);
+  const convId = useSystemStore(s => s.branchPanelConvId);
+  const label = useSystemStore(s => s.branchPanelLabel);
+  const projectKey = useSystemStore(s => s.branchPanelProjectKey);
+  const closeBranchPanel = useSystemStore(s => s.closeBranchPanel);
+
+  const branchChannel = branchId ? `branch:${branchId}` : null;
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // checkpointId, parentBranchId: openBranchPanel에서 전달된 값 우선, 없으면 convBranches에서 조회
+  const panelCheckpointId = useSystemStore(s => s.branchPanelCheckpointId);
+  const branchMeta = useContextStore(s => {
+    for (const list of Object.values(s.convBranchesByProject)) {
+      const found = list.find(b => b.id === branchId);
+      if (found) return found;
+    }
+    return undefined;
+  });
+  const checkpointId = panelCheckpointId ?? branchMeta?.checkpointId;
+  const parentBranchId = branchMeta?.parentBranchId;
+
+  // 부모 컨텍스트의 메시지 소스: 2단계 브랜치면 부모 브랜치, 1단계면 메인 대화
+  const parentMsgKey = parentBranchId ? `branch:${parentBranchId}` : convId;
+
+  const messagesRaw = useChatStore(s =>
+    branchChannel ? s.messages[branchChannel] : undefined,
+  );
+  // 서버가 주입하는 branch-context 메타 메시지 필터링
+  const branchMessages = (messagesRaw ?? EMPTY_MESSAGES).filter(
+    m => !m.content.startsWith('<!-- branch-context'),
+  );
+
+  // checkpoint 기반 부모 컨텍스트 — DB 우선, Zustand 반응형 폴백
+  const [dbParentContext, setDbParentContext] = useState<ChatMessage[]>([]);
+
+  // DB에서 부모 대화 메시지 로드 (1회)
+  useEffect(() => {
+    if (!parentMsgKey || !checkpointId) return;
+    if (!isTauriEnv()) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const db = await import('@/lib/db');
+        const rows = await db.loadMessages(parentMsgKey);
+        if (cancelled) return;
+        const msgs: ChatMessage[] = rows.map(r => ({
+          id: r.id, role: r.role as 'user' | 'assistant',
+          content: r.content, timestamp: r.timestamp,
+          status: (r.status as 'done') ?? 'done',
+          engine: r.engine, model: r.model, persona: r.persona,
+        }));
+        setDbParentContext(findCheckpointContext(msgs, checkpointId));
+      } catch (err) {
+        console.warn('[BranchPanel] DB parent load failed:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [parentMsgKey, checkpointId]);
+
+  // Zustand 반응형 폴백 — DB에 데이터가 없거나 비-Tauri 환경일 때
+  const storeParentMsgs = useChatStore(s => parentMsgKey ? s.messages[parentMsgKey] : undefined);
+  const storeParentContext = useMemo(
+    () => findCheckpointContext(storeParentMsgs, checkpointId),
+    [storeParentMsgs, checkpointId],
+  );
+
+  // DB 결과 우선, 없으면 Zustand 폴백
+  const parentContext = dbParentContext.length > 0 ? dbParentContext : storeParentContext;
+
+  // Bootstrap: create branch conversation + load history
+  useEffect(() => {
+    if (!branchChannel || !branchId || !convId || !projectKey) return;
+    const chat = useChatStore.getState();
+
+    // 부모 메시지가 Zustand에 없으면 서버에 요청 (Zustand 폴백용)
+    if (parentMsgKey && !chat.messages[parentMsgKey]?.length && checkpointId) {
+      if (parentBranchId) {
+        // 2단계 브랜치: 부모 브랜치의 히스토리 요청
+        tauriClient.sendRpc('conversation.history', { conversation_id: convId, branch_id: parentBranchId });
+      } else {
+        tauriClient.sendRpc('conversation.history', { conversation_id: convId });
+      }
+    }
+
+    if (!chat.conversations[branchChannel]) {
+      // Snapshot parent's settings so the branch starts with the same config
+      const parent = chat.conversations[convId];
+      chat.addConversation({
+        id: branchChannel,
+        projectKey,
+        label: label || branchId,
+        type: 'branch',
+        parentId: convId,
+        engine: parent?.engine,
+        model: parent?.model,
+        persona: parent?.persona,
+        triggerMode: parent?.triggerMode,
+        createdAt: Date.now(),
+      });
+    }
+
+    chat.setActiveBranch(branchId, label || branchId);
+
+    // 로컬에 메시지가 없을 때만 서버에 히스토리 요청
+    if (!chat.messages[branchChannel]?.length) {
+      tauriClient.sendRpc('conversation.history', {
+        conversation_id: convId,
+        branch_id: branchId,
+      });
+    }
+
+    // 패널 닫힐 때 activeBranch 정리
+    // (다른 브랜치로 전환된 경우에는 null로 초기화하지 않음 → 깜빡임 방지)
+    return () => {
+      const panelStillMine = useSystemStore.getState().branchPanelBranchId === branchId;
+      if (panelStillMine || useSystemStore.getState().branchPanelBranchId === null) {
+        const current = useChatStore.getState();
+        if (current.activeBranchId === branchId) {
+          current.setActiveBranch(null);
+        }
+      }
+    };
+  }, [branchChannel, branchId, convId, projectKey, checkpointId, parentMsgKey, parentBranchId]);
+
+  // 부모 컨텍스트 + 브랜치 메시지 합산
+  const messages = [...parentContext, ...branchMessages];
+
+  // Auto-scroll: 메시지 수가 실제로 증가했을 때만 (배열 참조 변경만으로는 트리거 안 함)
+  const prevMsgCountRef = useRef(0);
+  useEffect(() => {
+    const prevCount = prevMsgCountRef.current;
+    const curCount = messages.length;
+    prevMsgCountRef.current = curCount;
+    if (curCount <= prevCount || curCount === 0) return;
+    const behavior = prevCount === 0 && curCount > 1 ? 'instant' : 'smooth';
+    messagesEndRef.current?.scrollIntoView({ behavior });
+  }, [messages.length]);
+
+  // Auto-close when switching to a different main session
+  const activeConvId = useChatStore(s => s.activeConversationId);
+  useEffect(() => {
+    if (activeConvId && convId && activeConvId !== convId && !activeConvId.startsWith('branch:')) {
+      closeBranchPanel();
+    }
+  }, [activeConvId, convId, closeBranchPanel]);
+  // adopt/delete로 패널을 닫는 것은 tauriClient.ts에서 직접 closeBranchPanel() 호출
+
+  // Listen for branch deletion
+  useEffect(() => {
+    const handler = (event: CustomEvent) => {
+      if (event.detail?.branch_id === branchId) {
+        closeBranchPanel();
+      }
+    };
+    window.addEventListener('branch-deleted', handler as EventListener);
+    return () => window.removeEventListener('branch-deleted', handler as EventListener);
+  }, [branchId, closeBranchPanel]);
+
+  // Breadcrumb: parentBranchId 체인을 역추적해서 조상 레이블 수집
+  const breadcrumbKey = useContextStore(s => {
+    const allBranches = Object.values(s.convBranchesByProject).flat();
+    const trail: string[] = [];
+    let cur: string | undefined = branchId ?? undefined;
+    const visited = new Set<string>();
+    while (cur && !visited.has(cur)) {
+      visited.add(cur);
+      const b = allBranches.find(x => x.id === cur);
+      if (!b) break;
+      trail.unshift(b.label);
+      cur = b.parentBranchId;
+    }
+    return trail.join('\0'); // 직렬화하여 참조 안정화
+  });
+  const breadcrumb = useMemo(() => breadcrumbKey ? breadcrumbKey.split('\0') : [], [breadcrumbKey]);
+
+  // Pre-compute message metadata (same logic as ChatArea)
+  const msgMeta = useMemo(() => computeMsgMeta(messages), [messages]);
+
+  return (
+    <div className="flex flex-col h-full bg-[#0e0e0e] border-l border-outline-variant/30">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-outline-variant/30 shrink-0">
+        <GitFork size={16} className="text-violet-400 shrink-0" weight="bold" />
+        <div className="flex-1 min-w-0">
+          {breadcrumb.length > 1 ? (
+            <div className="flex items-center gap-1 text-[11px] text-on-surface-variant/40 truncate">
+              {breadcrumb.slice(0, -1).map((crumb, i) => (
+                <span key={i} className="flex items-center gap-1 shrink-0">
+                  <span>{crumb}</span>
+                  <span className="text-on-surface-variant/25">›</span>
+                </span>
+              ))}
+              <span className="font-medium text-violet-300 truncate">{breadcrumb[breadcrumb.length - 1]}</span>
+            </div>
+          ) : (
+            <span className="font-medium text-[13px] text-violet-300 truncate block">{label}</span>
+          )}
+        </div>
+        <button
+          onClick={() => {
+            if (!convId || !branchId) return;
+            // 중복 클릭 방지: 패널이 닫히기 전까지 재클릭 무시
+            const btn = document.activeElement as HTMLButtonElement;
+            btn?.setAttribute('disabled', 'true');
+            tauriClient.sendRpc('branch.adopt', { conversation_id: convId, branch_id: branchId });
+          }}
+          className="p-1 rounded text-on-surface-variant/40 hover:text-emerald-400 hover:bg-emerald-400/10 transition-colors disabled:opacity-30 disabled:pointer-events-none"
+          title="채택 (main에 병합)"
+        >
+          <GitMerge size={14} />
+        </button>
+        <button
+          onClick={() => {
+            if (!convId || !branchId) return;
+            const btn = document.activeElement as HTMLButtonElement;
+            btn?.setAttribute('disabled', 'true');
+            // 클라이언트 전용: SQLite status 업데이트 + store 반영
+            dbSync.syncBranchStatus(branchId, 'archived');
+            const ctxState = useContextStore.getState();
+            // convBranchesByProject에서 status 변경
+            const projectKey = useChatStore.getState().activeProjectKey ?? '';
+            const branches = ctxState.convBranchesByProject[projectKey] ?? [];
+            ctxState.setProjectConvBranches(projectKey, branches.map(b =>
+              b.id === branchId ? { ...b, status: 'archived' as const } : b
+            ));
+            useChatStore.getState().setActiveBranch(null);
+            closeBranchPanel();
+          }}
+          className="p-1 rounded text-on-surface-variant/40 hover:text-amber-400 hover:bg-amber-400/10 transition-colors disabled:opacity-30 disabled:pointer-events-none"
+          title="보관"
+        >
+          <Archive size={14} />
+        </button>
+        <button
+          onClick={closeBranchPanel}
+          className="p-1 rounded text-on-surface-variant/50 hover:text-on-surface hover:bg-white/5 transition-colors"
+          title="Close"
+        >
+          <X size={14} />
+        </button>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto pt-3 pb-4 space-y-0">
+        {messagesRaw === undefined ? (
+          <div className="flex items-center justify-center h-32 text-[11px] text-on-surface-variant/30">
+            Loading...
+          </div>
+        ) : messages.length === 0 ? (
+          <div className="flex items-center justify-center h-32 text-[11px] text-on-surface-variant/30">
+            브랜치 대화를 시작하세요.
+          </div>
+        ) : (
+          <>
+            {/* Parent context messages (dimmed) */}
+            {parentContext.length > 0 && (
+              <div className="opacity-50">
+                {parentContext.map((msg, i) => {
+                  const prev = i > 0 ? parentContext[i - 1] : null;
+                  const roleSwitch = prev !== null && prev.role !== msg.role;
+                  return <MessageView key={msg.id} msg={msg} isGrouped={false} isRoleSwitch={roleSwitch} conversationId={branchChannel ?? undefined} />;
+                })}
+                <div className="flex items-center gap-2 px-4 py-2 my-1">
+                  <div className="flex-1 border-t border-violet-400/20" />
+                  <span className="text-[10px] text-violet-400/40 font-mono shrink-0">branch start</span>
+                  <div className="flex-1 border-t border-violet-400/20" />
+                </div>
+              </div>
+            )}
+            {/* Branch messages */}
+            {branchMessages.map((msg, i) => {
+              const globalIdx = parentContext.length + i;
+              const meta = msgMeta[globalIdx];
+              return <MessageView key={msg.id} msg={msg} isGrouped={meta?.isGrouped ?? false} isRoleSwitch={meta?.isRoleSwitch ?? false} conversationId={branchChannel ?? undefined} prevAssistantModel={meta?.prevAssistantModel} />;
+            })}
+          </>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input — scoped to branch channel */}
+      <div className="shrink-0">
+        <InputArea overrideConversationId={branchChannel ?? undefined} compact />
+      </div>
+    </div>
+  );
+}

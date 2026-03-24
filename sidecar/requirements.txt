@@ -1,0 +1,2 @@
+# tunaChat sidecar dependencies — minimal
+# Python 3.11+ required (match tunapi)
