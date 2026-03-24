@@ -50,10 +50,9 @@ fn scan_workspace(root: String) -> Result<Vec<serde_json::Value>, String> {
             .any(|d| path.join(d).exists());
 
         let project_type = match (has_git, has_agent_session) {
-            (true, true) => "project",
-            (true, false) => "discovered",
-            (false, true) => "chat",
-            (false, false) => continue, // skip
+            (true, _) => "project",     // .git 있으면 무조건 PROJECT
+            (false, true) => "chat",    // 세션만 있으면 CHATS
+            (false, false) => continue, // 둘 다 없으면 무시
         };
 
         // Detect default engine from which agent sessions exist

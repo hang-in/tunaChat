@@ -151,7 +151,7 @@ export async function hydrateFromDb(): Promise<void> {
               ...newProjects.map(r => ({
                 key: r.key, name: r.name, path: r.path,
                 defaultEngine: r.defaultEngine,
-                source: (r.type === 'discovered' ? 'discovered' : 'configured') as 'configured' | 'discovered',
+                source: 'configured' as const,
                 type: r.type as 'project' | 'channel',
               })),
             ];
@@ -160,7 +160,7 @@ export async function hydrateFromDb(): Promise<void> {
               await db.upsertProject({
                 key: r.key, name: r.name, path: r.path,
                 defaultEngine: r.defaultEngine,
-                source: r.type === 'discovered' ? 'discovered' : 'configured',
+                source: 'configured',
                 type: r.type,
               });
             }
@@ -183,27 +183,32 @@ export async function hydrateFromDb(): Promise<void> {
       }
     } catch { /* scan failed — continue without it */ }
 
-    // 6. 첫 실행: 프로젝트가 없으면 기본 프로젝트 + 대화 생성
+    // 6. 첫 실행: 프로젝트가 없으면 최소 프로젝트 생성 (설정에서 워크스페이스 스캔 유도)
     if (useChatStore.getState().projects.length === 0) {
-      const defaultProject = {
-        key: 'default',
-        name: 'tunaChat',
-        source: 'configured' as const,
-        type: 'project' as const,
-      };
-      chat.setProjects([defaultProject]);
-      chat.setActiveProject('default');
-      const convId = chat.createConversation('default', 'main', 'New Chat');
-      // persist to SQLite
-      await db.upsertProject({ key: 'default', name: 'tunaChat', source: 'configured', type: 'project' });
-      const conv = chat.conversations[convId];
-      if (conv) {
-        await db.upsertConversation({
-          id: conv.id, projectKey: conv.projectKey, label: conv.label,
-          type: conv.type, createdAt: conv.createdAt,
-        });
+      // 워크스페이스 루트가 있으면 그걸 사용, 없으면 기본값
+      const freshProjects = useChatStore.getState().projects;
+      if (freshProjects.length === 0) {
+        const defaultProject = {
+          key: 'general',
+          name: 'General',
+          source: 'configured' as const,
+          type: 'project' as const,
+        };
+        useChatStore.getState().setProjects([defaultProject]);
+        useChatStore.getState().setActiveProject('general');
+        const convId = useChatStore.getState().createConversation('general', 'main', 'New Chat');
+        await db.upsertProject({ key: 'general', name: 'General', source: 'configured', type: 'project' });
+        const conv = useChatStore.getState().conversations[convId];
+        if (conv) {
+          await db.upsertConversation({
+            id: conv.id, projectKey: conv.projectKey, label: conv.label,
+            type: conv.type, createdAt: conv.createdAt,
+          });
+        }
+        // 첫 실행 시 설정 페이지 열기 (워크스페이스 설정 유도)
+        useSystemStore.getState().setSettingsOpen(true);
       }
-      console.log('[dbHydrate] first launch — created default project and conversation');
+      console.log('[dbHydrate] first launch — created general project, settings page opened');
     } else {
       console.log('[dbHydrate] loaded', projects.length, 'projects,', convs.length, 'conversations from SQLite');
     }

@@ -439,7 +439,7 @@ export function InputArea({ overrideConversationId, compact }: { overrideConvers
               for (const r of results) {
                 syncProject({
                   key: r.key, name: r.name, path: r.path,
-                  defaultEngine: r.defaultEngine, source: r.type === 'discovered' ? 'discovered' : 'configured',
+                  defaultEngine: r.defaultEngine, source: 'configured',
                   type: r.type,
                 });
               }
@@ -448,7 +448,7 @@ export function InputArea({ overrideConversationId, compact }: { overrideConvers
                 ...results.map(r => ({
                   key: r.key, name: r.name, path: r.path,
                   defaultEngine: r.defaultEngine,
-                  source: (r.type === 'discovered' ? 'discovered' : 'configured') as 'configured' | 'discovered',
+                  source: 'configured' as const,
                   type: r.type as 'project' | 'channel',
                 })),
               ]);

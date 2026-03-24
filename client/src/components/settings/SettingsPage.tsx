@@ -119,7 +119,7 @@ function GeneralTab() {
           .map(r => ({
             key: r.key, name: r.name, path: r.path,
             defaultEngine: r.defaultEngine,
-            source: (r.type === 'discovered' ? 'discovered' : 'configured') as 'configured' | 'discovered',
+            source: 'configured' as const,
             type: r.type as 'project' | 'channel',
           })),
       ];
@@ -137,12 +137,14 @@ function GeneralTab() {
         syncProject({
           key: r.key, name: r.name, path: r.path,
           defaultEngine: r.defaultEngine,
-          source: r.type === 'discovered' ? 'discovered' : 'configured',
+          source: 'configured',
           type: r.type,
         });
       }
 
-      setScanResult(`${results.length}개 프로젝트 발견 (${results.filter(r => r.type === 'project').length} project, ${results.filter(r => r.type === 'discovered').length} discovered)`);
+      const projectCount = results.filter(r => r.type === 'project').length;
+      const chatCount = results.filter(r => r.type === 'chat').length;
+      setScanResult(`${results.length}개 발견 (${projectCount} project${chatCount > 0 ? `, ${chatCount} chat` : ''})`);
     } catch (err) {
       setScanResult(`스캔 실패: ${err}`);
     }
