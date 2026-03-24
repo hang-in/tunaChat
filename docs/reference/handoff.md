@@ -228,12 +228,15 @@ cargo check
 
 ## 8. 미완료 항목
 
-### Phase 5 (하네스 아키텍처) — 진행 중
+### Phase 5 (하네스 아키텍처)
 **문서**: `docs/plans/harness-architecture.md`
 
-#### MVP-1 남은 것
-- [ ] 토큰 추적 (DB v5 마이그레이션)
-- [ ] `project.context` RPC를 Rust `get_project_context`로 교체 (현재 하드코딩)
+#### MVP-1 — 완료
+- [x] Rust scan_workspace, get_project_context
+- [x] agentLoader.ts (frontmatter 파싱 → persona/RBAC)
+- [x] sidecar: system_prompt + allowed_tools 전달
+- [x] 토큰 추적 (DB v5)
+- [x] project.context Rust 연동
 
 #### MVP-2 (다음 단계)
 - [ ] architect → developer Task Brief 위임 + 브랜치 자동 생성
