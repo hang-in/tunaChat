@@ -32,7 +32,7 @@ export interface Project {
   path?: string;
   defaultEngine?: string;
   source: 'configured' | 'discovered';
-  type?: 'project' | 'channel';  // backend가 보내는 분류
+  type?: 'project' | 'channel' | 'chat';  // project: .git 있음, chat: 세션만, channel: legacy
   currentEngine?: string;
   currentModel?: string;
   persona?: string;

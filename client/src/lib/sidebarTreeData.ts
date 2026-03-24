@@ -37,10 +37,13 @@ export function useSidebarTreeData(searchTerm: string): SidebarNode[] {
   return useMemo(() => {
     const q = searchTerm.trim().toLowerCase();
 
-    // 3-way categorization
-    const configured = projects.filter(p => p.source === 'configured' && p.type !== 'channel');
-    const discovered = projects.filter(p => p.source === 'discovered');
-    const channels = projects.filter(p => p.type === 'channel');
+    // 3-way categorization by type (not source)
+    const projectType = projects.filter(p => p.type === 'project' || (!p.type && p.source === 'configured'));
+    const chatType = projects.filter(p => p.type === 'chat' || p.type === 'channel');
+    // Legacy: source === 'discovered' that wasn't updated → treat as project
+    const legacyDisc = projects.filter(p => p.source === 'discovered' && p.type !== 'chat' && p.type !== 'channel' && p.type !== 'project');
+    const configured = [...projectType, ...legacyDisc];
+    const channels = chatType;
 
     function buildProjectNode(proj: typeof projects[0], isDisc: boolean): SidebarNode | null {
       const pk = proj.key;
@@ -133,16 +136,10 @@ export function useSidebarTreeData(searchTerm: string): SidebarNode[] {
     const projCat = buildCategory('cat:projects', 'Projects', configured, false);
     if (projCat) result.push(projCat);
 
-    const chanCat = buildCategory('cat:chat', 'Chat', channels, false);
-    if (chanCat) {
+    const chatCat = buildCategory('cat:chats', 'Chats', channels, false);
+    if (chatCat) {
       if (result.length > 0) result.push({ id: `sep:${sepIdx++}`, name: '', nodeType: 'separator' });
-      result.push(chanCat);
-    }
-
-    const discCat = buildCategory('cat:disc', 'Disc', discovered, true);
-    if (discCat) {
-      if (result.length > 0) result.push({ id: `sep:${sepIdx++}`, name: '', nodeType: 'separator' });
-      result.push(discCat);
+      result.push(chatCat);
     }
 
     return result;

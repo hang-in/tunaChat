@@ -54,8 +54,14 @@ fn scan_workspace(root: String) -> Result<Vec<serde_json::Value>, String> {
 
         // Count Claude Code sessions from ~/.claude/projects/<encoded-path>/
         let abs_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-        let encoded_path = abs_path
-            .to_string_lossy()
+        let abs_str = abs_path.to_string_lossy().to_string();
+        // Windows canonicalize adds \\?\ prefix — strip it
+        let clean_path = if abs_str.starts_with("\\\\?\\") {
+            &abs_str[4..]
+        } else {
+            &abs_str
+        };
+        let encoded_path = clean_path
             .replace('\\', "-")
             .replace('/', "-")
             .replace(':', "-");

@@ -123,11 +123,16 @@ function GeneralTab() {
             type: r.type as 'project' | 'channel',
           })),
       ];
-      // Update path for existing projects that didn't have one
+      // Update path, type, and source for existing projects
       const updated = merged.map(p => {
         const scanned = results.find(r => r.key === p.key);
-        if (scanned && !p.path) return { ...p, path: scanned.path };
-        return p;
+        if (!scanned) return p;
+        return {
+          ...p,
+          path: scanned.path || p.path,
+          type: (scanned.type as 'project' | 'channel') || p.type,
+          source: 'configured' as const,
+        };
       });
       chat.setProjects(updated);
 
