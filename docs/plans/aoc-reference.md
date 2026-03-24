@@ -299,11 +299,12 @@ tunaChat/
 - [x] `project.context` RPC를 Rust `get_project_context`로 교체 (git branch, markdown, memos, conv_settings 병합)
 
 #### MVP-2
+- [ ] 스킬 시스템: 글로벌 스킬 라이브러리 스캔 + SKILL.md 파싱
+- [ ] 스킬 시스템: 프로젝트/브랜치 단위 activeSkills (DB v6)
+- [ ] 스킬 시스템: context prefix 주입 + `!skill` 커맨드
 - [ ] architect → developer Task Brief 위임 + 브랜치 자동 생성
 - [ ] 사용자 승인 게이트 UI (Plan Approve / Merge Gate 버튼)
 - [ ] 대화 브랜치 ↔ git branch 자동 연동
-- [ ] 스킬 시스템 (프로젝트/브랜치 단위 로딩)
-- [ ] 아티팩트 테이블 (v5 마이그레이션)
 
 #### MVP-3 (고급 — 선택적)
 - [ ] 자동 리뷰 에이전트 (code-reviewer, 다른 모델)

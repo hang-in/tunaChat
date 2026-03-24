@@ -86,34 +86,107 @@ tools:
 
 ## 4. 스킬 시스템
 
-tunaDish `feature-ideas.md` 기획 기반:
+### 스킬이란
 
-### 에이전트별 스킬 경로
+스킬 = **외부 도메인 지식 패키지**. 에이전트가 특정 기술을 사용할 때 필요한 공식 가이드/API 참조/패턴을 구조화한 문서.
+Anthropic, OpenAI, Vercel, Supabase 등이 배포하는 공식 스킬 팩이 존재.
 
-| 에이전트 | 경로 | 포맷 |
+> tunaDish의 "에이전트별 스킬 경로"와는 다른 개념.
+> CLI 에이전트의 내장 스킬이 아니라, **tunaChat이 관리하는 외부 도메인 지식 라이브러리**.
+
+### 스킬 팩 소스
+
+현재 `_research/_skills/`에 수집된 공식 팩:
+
+| 스킬 팩 | 출처 | 내용 |
 |---------|------|------|
-| Claude Code | `~/.claude/commands/` | Markdown |
-| Codex CLI | `~/.codex/skills/` | SKILL.md + frontmatter |
-| Gemini CLI | `~/.gemini/extensions/` | gemini-extension.json |
-| rawq | `vendor/rawq/SKILL.md` | Markdown |
+| `skills-anthropic` | Anthropic | Claude API, Agent SDK, PDF, Canvas, Brand Guidelines 등 |
+| `skills-openai` | OpenAI | Codex 관련 스킬 |
+| `skills-microsoft` | Microsoft | Agents, Marketplace |
+| `skills-vercel` | Vercel | Next.js, v0 등 |
+| `skills-supabase` | Supabase | Supabase SDK, Edge Functions |
+| `skills-remotion` | Remotion | 비디오 렌더링 |
 
-### 프로젝트/브랜치 단위 스킬
+### 스킬 파일 형식 (SKILL.md)
+
+```yaml
+---
+name: claude-api
+description: "Build apps with Claude API. TRIGGER when: code imports anthropic..."
+license: Complete terms in LICENSE.txt
+---
+# 스킬 본문 (도메인 지식)
+...
+```
+
+### 프로젝트/브랜치 단위 활성화
 
 ```
-Project skills:
-  .tunaChat/skills/      ← 프로젝트 로컬 스킬
-  docs/agents/*.md       ← 에이전트 정의 (스킬의 확장 형태)
+프로젝트 설정:
+  activeSkills: ["claude-api", "supabase"]
+    → 해당 프로젝트의 모든 대화에서 이 스킬이 context로 주입됨
 
-Branch-level override:
-  브랜치 생성 시 사용할 스킬 선택 → Task Brief에 포함
+브랜치 오버라이드:
+  branch "task-1-impl":
+    activeSkills: ["claude-api", "supabase", "pdf"]
+    → 이 브랜치에서만 pdf 스킬 추가 활성화
+
+대화 수준:
+  사용자가 "PDF 만들어줘" 입력
+    → tunaChat이 관련 스킬 추천 ("pdf 스킬 활성화할까요?")
+    → 활성화 → 다음 메시지부터 스킬 content가 프롬프트에 주입
+```
+
+### 스킬 로딩 흐름
+
+```
+chat.send 호출
+  → conversation.activeSkills 확인
+    → 프로젝트 레벨 + 브랜치 레벨 병합
+  → 각 스킬의 SKILL.md frontmatter + body 로드
+  → body를 system prompt에 context로 추가
+    (agent system prompt + skill content + user prompt)
+  → sidecar에 전달
+```
+
+### 스킬 저장 위치
+
+```
+스킬 라이브러리 (글로벌):
+  ~/.tunachat/skills/          ← 사용자 홈
+    ├─ skills-anthropic/
+    ├─ skills-openai/
+    └─ skills-vercel/
+
+프로젝트 로컬 스킬:
+  <project>/.tunachat/skills/  ← 프로젝트별 커스텀 스킬
 ```
 
 ### 로딩 우선순위
 
-1. 브랜치 지정 스킬 (가장 높음)
-2. 프로젝트 `.tunaChat/skills/`
-3. 사용자 홈 디렉토리 (`~/.claude/commands/` 등)
-4. 시스템 기본 (rawq SKILL.md)
+1. 브랜치 activeSkills (가장 높음)
+2. 프로젝트 activeSkills
+3. 프로젝트 로컬 `.tunachat/skills/`
+4. 글로벌 `~/.tunachat/skills/`
+
+### DB 스키마
+
+```sql
+-- conversations 테이블에 추가 (v6 마이그레이션)
+ALTER TABLE conversations ADD COLUMN active_skills TEXT DEFAULT '[]';  -- JSON array
+-- projects 테이블에 추가
+ALTER TABLE projects ADD COLUMN active_skills TEXT DEFAULT '[]';       -- JSON array
+```
+
+### 에이전트 파일 vs 스킬
+
+| | 에이전트 (docs/agents/*.md) | 스킬 (~/.tunachat/skills/) |
+|---|---|---|
+| **역할** | 에이전트의 정체성 + 도구 권한 | 도메인 지식 |
+| **적용 단위** | 대화 persona | 프로젝트/브랜치 activeSkills |
+| **내용** | system prompt + RBAC | API 참조, 패턴, 가이드 |
+| **주입 방식** | `--append-system-prompt` | context prefix |
+| **출처** | 사용자 정의 | 공식 스킬 팩 (Anthropic, OpenAI 등) |
 
 ---
 
@@ -221,11 +294,14 @@ ALTER TABLE projects ADD COLUMN workspace_root TEXT;
 - [ ] `!project set` / `!project scan` 커맨드
 
 ### MVP-2
+- [ ] **스킬 시스템**: 글로벌 스킬 라이브러리 스캔 (`~/.tunachat/skills/`)
+- [ ] **스킬 시스템**: 프로젝트/브랜치 단위 activeSkills 설정 (DB v6)
+- [ ] **스킬 시스템**: SKILL.md frontmatter 파싱 → 매칭 → context prefix 주입
+- [ ] **스킬 시스템**: `!skill list`, `!skill add <name>`, `!skill remove <name>` 커맨드
 - [ ] architect → developer 위임 (Task Brief 자동 생성 → 브랜치 생성)
 - [ ] 사용자 승인 게이트 UI (Plan Approve / Merge Gate 버튼)
 - [ ] 대화 브랜치 ↔ git branch 자동 연동
-- [ ] 아티팩트 테이블 (v5 마이그레이션)
-- [ ] 스킬 로딩 (프로젝트/브랜치 단위)
+- [ ] 아티팩트 테이블 활용 (v5 마이그레이션에 이미 생성됨)
 
 ### MVP-3 (고급 — 선택적)
 - [ ] 자동 리뷰 에이전트 (code-reviewer, 다른 모델)
