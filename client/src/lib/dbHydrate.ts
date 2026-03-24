@@ -130,8 +130,61 @@ export async function hydrateFromDb(): Promise<void> {
       }
     }
 
-    // 5. 첫 실행: 프로젝트가 없으면 기본 프로젝트 + 대화 생성
-    if (projects.length === 0) {
+    // 5. 자동 스캔: 저장된 워크스페이스 루트가 있으면 재스캔하여 프로젝트 목록 갱신
+    try {
+      const savedRoot = localStorage.getItem('tunachat:workspaceRoot');
+      if (savedRoot && isTauriEnv()) {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const results = await invoke<Array<{
+          key: string; name: string; path: string; type: string;
+          defaultEngine: string; gitBranch: string | null;
+        }>>('scan_workspace', { root: savedRoot });
+
+        if (results.length > 0) {
+          const currentChat = useChatStore.getState();
+          const existingKeys = new Set(currentChat.projects.map(p => p.key));
+          const newProjects = results.filter(r => !existingKeys.has(r.key));
+
+          if (newProjects.length > 0) {
+            const merged = [
+              ...currentChat.projects,
+              ...newProjects.map(r => ({
+                key: r.key, name: r.name, path: r.path,
+                defaultEngine: r.defaultEngine,
+                source: (r.type === 'discovered' ? 'discovered' : 'configured') as 'configured' | 'discovered',
+                type: r.type as 'project' | 'channel',
+              })),
+            ];
+            currentChat.setProjects(merged);
+            for (const r of newProjects) {
+              await db.upsertProject({
+                key: r.key, name: r.name, path: r.path,
+                defaultEngine: r.defaultEngine,
+                source: r.type === 'discovered' ? 'discovered' : 'configured',
+                type: r.type,
+              });
+            }
+            console.log('[dbHydrate] auto-scan found', newProjects.length, 'new projects');
+          }
+
+          // Update paths for existing projects that didn't have one
+          for (const r of results) {
+            const existing = useChatStore.getState().projects.find(p => p.key === r.key);
+            if (existing && !existing.path) {
+              useChatStore.getState().setProjects(
+                useChatStore.getState().projects.map(p =>
+                  p.key === r.key ? { ...p, path: r.path } : p
+                )
+              );
+              await db.upsertProject({ key: r.key, name: r.name, path: r.path });
+            }
+          }
+        }
+      }
+    } catch { /* scan failed — continue without it */ }
+
+    // 6. 첫 실행: 프로젝트가 없으면 기본 프로젝트 + 대화 생성
+    if (useChatStore.getState().projects.length === 0) {
       const defaultProject = {
         key: 'default',
         name: 'tunaChat',

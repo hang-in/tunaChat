@@ -75,9 +75,113 @@ function GeneralTab() {
   const activeProjectKey = useChatStore(s => s.activeProjectKey);
   const projects = useChatStore(s => s.projects);
   const activeProject = projects.find(p => p.key === activeProjectKey);
+  const [workspaceRoot, setWorkspaceRoot] = useState(() => {
+    try { return localStorage.getItem('tunachat:workspaceRoot') || ''; } catch { return ''; }
+  });
+  const [scanning, setScanning] = useState(false);
+  const [scanResult, setScanResult] = useState('');
+
+  const handleSelectFolder = async () => {
+    if (!isTauriEnv()) return;
+    // Tauri dialog plugin may not be installed — prompt for manual input
+    const input = window.prompt('워크스페이스 루트 폴더 경로를 입력하세요:', workspaceRoot || 'D:\\projects');
+    if (input) {
+      setWorkspaceRoot(input);
+      localStorage.setItem('tunachat:workspaceRoot', input);
+      handleScan(input);
+    }
+  };
+
+  const handleScan = async (root?: string) => {
+    const scanPath = root || workspaceRoot;
+    if (!scanPath || !isTauriEnv()) return;
+    setScanning(true);
+    setScanResult('');
+    try {
+      const results = await invoke<Array<{
+        key: string; name: string; path: string; type: string;
+        defaultEngine: string; gitBranch: string | null;
+      }>>('scan_workspace', { root: scanPath });
+
+      if (results.length === 0) {
+        setScanResult('프로젝트를 찾지 못했습니다.');
+        setScanning(false);
+        return;
+      }
+
+      // Merge with existing projects (keep existing sessions, add new ones)
+      const chat = useChatStore.getState();
+      const existingKeys = new Set(chat.projects.map(p => p.key));
+      const merged = [
+        ...chat.projects,
+        ...results
+          .filter(r => !existingKeys.has(r.key))
+          .map(r => ({
+            key: r.key, name: r.name, path: r.path,
+            defaultEngine: r.defaultEngine,
+            source: (r.type === 'discovered' ? 'discovered' : 'configured') as 'configured' | 'discovered',
+            type: r.type as 'project' | 'channel',
+          })),
+      ];
+      // Update path for existing projects that didn't have one
+      const updated = merged.map(p => {
+        const scanned = results.find(r => r.key === p.key);
+        if (scanned && !p.path) return { ...p, path: scanned.path };
+        return p;
+      });
+      chat.setProjects(updated);
+
+      // Persist to DB
+      const { syncProject } = await import('@/lib/dbSync');
+      for (const r of results) {
+        syncProject({
+          key: r.key, name: r.name, path: r.path,
+          defaultEngine: r.defaultEngine,
+          source: r.type === 'discovered' ? 'discovered' : 'configured',
+          type: r.type,
+        });
+      }
+
+      setScanResult(`${results.length}개 프로젝트 발견 (${results.filter(r => r.type === 'project').length} project, ${results.filter(r => r.type === 'discovered').length} discovered)`);
+    } catch (err) {
+      setScanResult(`스캔 실패: ${err}`);
+    }
+    setScanning(false);
+  };
 
   return (
     <div className="space-y-6">
+      <Section title="워크스페이스">
+        <div className="flex items-center gap-2 mb-2">
+          <input
+            type="text"
+            value={workspaceRoot}
+            onChange={e => {
+              setWorkspaceRoot(e.target.value);
+              localStorage.setItem('tunachat:workspaceRoot', e.target.value);
+            }}
+            placeholder="D:\projects"
+            className="flex-1 bg-surface-container-high border border-outline-variant/40 rounded-md px-3 py-1.5 text-[13px] text-on-surface font-mono outline-none focus:border-primary"
+          />
+          <button
+            onClick={handleSelectFolder}
+            className="px-3 py-1.5 text-[12px] bg-surface-container-high border border-outline-variant/40 rounded-md text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest transition-colors"
+          >
+            폴더 선택
+          </button>
+          <button
+            onClick={() => handleScan()}
+            disabled={scanning || !workspaceRoot}
+            className="px-3 py-1.5 text-[12px] bg-primary/10 text-primary rounded-md hover:bg-primary/20 transition-colors disabled:opacity-40"
+          >
+            {scanning ? '스캔 중...' : '스캔'}
+          </button>
+        </div>
+        {scanResult && (
+          <p className="text-[11px] text-on-surface-variant/50">{scanResult}</p>
+        )}
+      </Section>
+
       <Section title="활성 프로젝트">
         <div className="text-[13px] text-on-surface/80">
           {activeProject?.name || '없음'}
@@ -85,6 +189,17 @@ function GeneralTab() {
             <span className="ml-2 text-on-surface-variant/40 font-mono text-[11px]">{activeProject.path}</span>
           )}
         </div>
+        {projects.length > 1 && (
+          <select
+            className="mt-2 bg-surface-container-high border border-outline-variant/40 rounded-md px-3 py-1.5 text-[13px] text-on-surface outline-none focus:border-primary w-full"
+            value={activeProjectKey || ''}
+            onChange={e => useChatStore.getState().setActiveProject(e.target.value)}
+          >
+            {projects.map(p => (
+              <option key={p.key} value={p.key}>{p.name} [{p.source}] {p.path ? `(${p.path})` : ''}</option>
+            ))}
+          </select>
+        )}
       </Section>
       <Section title="기본 엔진">
         <select
